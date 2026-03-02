@@ -67,7 +67,7 @@ static void setConstants()
             auto tempStr = llvm::StringRef(fullWord);
 
             // key exists in symbol table, do not add to the constants.
-            if (STMap.count(fullWord) == 0 && ConstMap.count(tempStr) == 0 && strcmp(programStr, fullWord) != 0)
+            if (STMap.count(fullWord) == 0 && ConstMap.count(tempStr.str()) == 0 && strcmp(programStr, fullWord) != 0)
             {
                 llvm::Constant *strConstant = TheBuilder.CreateGlobalString(tempStr);
                 ConstMap[fullWord] = strConstant;
@@ -219,25 +219,43 @@ static llvm::Value *AddRoutineCall(tree theStmt)
     uintptr_t funcValue;
     std::vector<llvm::Value *> arguments;
 
-    // Case 1: Check for method call with object (system.println)
+    // Case 1: Check for method call with object (system.println / system.readln)
     if ((NodeOp(selectOp) == SelectOp && STInvertedMap[IntVal(objectVar)].compare("system") == 0))
     {
-        // printf("SYSTEM");
+        // Determine which system method is being called
+        std::string methodName = STInvertedMap[IntVal(LeftChild(LeftChild(selectOp)))];
+
+        if (methodName == "readln")
+        {
+            // system.readln(x) → scanf("%d", &x)
+            // Get the variable being read into
+            tree argExpr = LeftChild(argumentTree);
+            tree argId = LeftChild(argExpr);
+            int stIdx = IntVal(argId);
+            llvm::Value *varPtr = (llvm::Value *)GetAttr(stIdx, OBJECT_ATTR);
+
+            // Create scanf format string and call
+            static llvm::Function *funcScanf = nullptr;
+            if (!funcScanf) {
+                llvm::FunctionType *scanfType = llvm::FunctionType::get(
+                    llvm::IntegerType::get(TheContext, 32),
+                    {llvm::PointerType::getUnqual(TheContext)},
+                    true);
+                funcScanf = llvm::Function::Create(scanfType, llvm::Function::ExternalLinkage, "scanf", TheModule.get());
+            }
+            llvm::Value *scanfFmt = TheBuilder.CreateGlobalString("%d", "scanf.int");
+            return TheBuilder.CreateCall(funcScanf, {scanfFmt, varPtr}, "readln");
+        }
+
+        // system.println — use printf
         arguments = AddCallArgs(argumentTree);
 
-        llvm::Constant *formatStr = ConstMap["\n"];
-        // createFormatStr(arguments, formatStr);
-        // llvm::Value *data = TheBuilder.CreateLoad(arguments[0]->getType()->getPointerElementType(), arguments[0], "yo");
+        // printf needs a format string as first arg
+        llvm::Constant *formatStr = nullptr;
+        createFormatStr(arguments, formatStr);
+        arguments.insert(arguments.begin(), formatStr);
 
-        // arguments.push_(formatStr);
-        // arguments.insert(arguments.begin(), formatStr);
-        // llvm::CallInst *callInst = llvm::CallInst::Create(funcPrintf, arguments, "println", bb);
-
-        // arguments.clear();
-        // llvm::Constant *newlineConst = ConstMap["\n"];
-        // arguments.push_back(newlineConst);
-        return llvm::CallInst::Create(funcPrintf, arguments, "print", bb);
-        // llvm::ConstantInt::get(TheContext, llvm::APInt(32, 0));
+        return TheBuilder.CreateCall(funcPrintf, arguments, "print");
     }
 
     else if (NodeOp(selectOp) == SelectOp)
@@ -253,8 +271,8 @@ static llvm::Value *AddRoutineCall(tree theStmt)
         // Process arguments for the call
         arguments = AddCallArgs(argumentTree);
 
-        llvm::CallInst *callInst = llvm::CallInst::Create(llvmFunc, arguments, "ELLLO", bb);
-        return callInst;
+        llvm::Function *llvmFn = llvm::dyn_cast<llvm::Function>(llvmFunc);
+        return TheBuilder.CreateCall(llvmFn, arguments, "ELLLO");
     }
     // Case 2: Simple function call without SelectOp
     else if (!IsNull(theStmt) && IsNull(selectOp))
@@ -271,7 +289,8 @@ static llvm::Value *AddRoutineCall(tree theStmt)
         llvm::Value *llvmFunc = (llvm::Value *)funcValue;
 
         arguments = AddCallArgs(argumentTree);
-        llvm::CallInst *callInst = llvm::CallInst::Create(llvmFunc, arguments, "ELLLO", bb);
+        llvm::Function *llvmFn2 = llvm::dyn_cast<llvm::Function>(llvmFunc);
+        llvm::CallInst *callInst = TheBuilder.CreateCall(llvmFn2, arguments, "ELLLO");
         return callInst;
     }
     else
@@ -290,17 +309,17 @@ void createFormatStr(std::vector<llvm::Value *> &arguments, llvm::Constant *&for
     if (arguments[0]->getType()->isIntegerTy())
     {
         // If it's an integer, use "%d" format specifier
-        formatStr = TheBuilder.CreateGlobalStringPtr("%d\n", "printf.num");
+        formatStr = TheBuilder.CreateGlobalString("%d\n", "printf.num");
     }
     else if (arguments[0]->getType()->isPointerTy())
     {
         // If it's a string (pointer), use "%s" format specifier
-        formatStr = TheBuilder.CreateGlobalStringPtr("%s\n", "printf.str");
+        formatStr = TheBuilder.CreateGlobalString("%s\n", "printf.str");
     }
     else
     {
         // Default fallback
-        formatStr = TheBuilder.CreateGlobalStringPtr("\n", "printf.newline");
+        formatStr = TheBuilder.CreateGlobalString("\n", "printf.newline");
     }
 }
 
@@ -344,16 +363,20 @@ static llvm::Value *AddFactor(uintptr_t factorTree)
 
                 if (llvm::AllocaInst *alloca = llvm::dyn_cast<llvm::AllocaInst>(opInit))
                 {
-                    // It is an AllocaInst
-                    llvm::Value *store = TheBuilder.CreateStore(llvm::ConstantInt::get(TheContext, llvm::APInt(32, 4)), opInit);
-                    return store;
+                    // Load the value from the local variable
+                    return TheBuilder.CreateLoad(alloca->getAllocatedType(), alloca, factorStr);
                 }
                 else
                 {
 
                     // llvm::Value *classUsage = TheBuilder.CreateStructGEP(TheModule->getNamedGlobal("Variables.global"), 0, "point.x");
                     // also
-                    llvm::Value *classLoad = TheBuilder.CreateLoad(opInit->getType()->getPointerElementType(), opInit, "point.x.val");
+                    // With opaque pointers, we need to figure out the pointee type.
+                    // For global variables, use getValueType(); otherwise default to i32.
+                    llvm::Type *loadTy = llvm::Type::getInt32Ty(TheContext);
+                    if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(opInit))
+                        loadTy = GV->getValueType();
+                    llvm::Value *classLoad = TheBuilder.CreateLoad(loadTy, opInit, "point.x.val");
                     return classLoad;
                 }
             }
@@ -534,30 +557,33 @@ static llvm::Value *AddSimpleExpr(uintptr_t exprTree)
 static llvm::Value *AddExpr(uintptr_t exprTree)
 {
     tree expr = (tree)exprTree;
-    // TODO emit simple expression with proper comparison
-    // if (NodeOp(expr) == LTOp)
-    // {
-    // }
-    // else if (NodeOp(expr) == LEOp)
-    // {
-    // }
-    // else if (NodeOp(expr) == GTOp)
-    // {
-    // }
-    // else if (NodeOp(expr) == GEOp)
-    // {
-    // }
-    // else if (NodeOp(expr) == EQOp)
-    // {
-    // }
-    // else if (NodeOp(expr) == NEOp)
-    // {
-    // }
-    // else
-    // {
-    // printf("Here in expression\n");
+    int op = NodeOp(expr);
+
+    // Comparison operators
+    if (op == LTOp || op == LEOp || op == GTOp || op == GEOp || op == EQOp || op == NEOp)
+    {
+        llvm::Value *left = AddSimpleExpr((uintptr_t)LeftChild(expr));
+        llvm::Value *right = AddSimpleExpr((uintptr_t)RightChild(expr));
+
+        llvm::Value *cmp = nullptr;
+        if (op == LTOp)
+            cmp = TheBuilder.CreateICmpSLT(left, right, "lt");
+        else if (op == LEOp)
+            cmp = TheBuilder.CreateICmpSLE(left, right, "le");
+        else if (op == GTOp)
+            cmp = TheBuilder.CreateICmpSGT(left, right, "gt");
+        else if (op == GEOp)
+            cmp = TheBuilder.CreateICmpSGE(left, right, "ge");
+        else if (op == EQOp)
+            cmp = TheBuilder.CreateICmpEQ(left, right, "eq");
+        else if (op == NEOp)
+            cmp = TheBuilder.CreateICmpNE(left, right, "ne");
+
+        // Extend i1 to i32 for use in expressions
+        return TheBuilder.CreateZExt(cmp, llvm::Type::getInt32Ty(TheContext), "cmp_ext");
+    }
+
     return AddSimpleExpr(exprTree);
-    // }
 }
 
 static void AddStmt(tree theStmt)
@@ -571,24 +597,167 @@ static void AddStmt(tree theStmt)
     {
     case AssignOp:
     {
-        // this variable should be available in the current context already
-        // it was defined as a register already, when we processed declop.
-        // even method params maybe you could assign to also, (probably).
-
-        // left side of equals sign in an assignment op
-        tree varTree = RightChild(LeftChild(theStmt));
+        // AssignmentStatement grammar: AssignOp(AssignOp(Null, Variable), Expression)
+        // So left child is AssignOp wrapping the variable, right child is the expression
+        tree leftAssign = LeftChild(theStmt);
         tree exprTree = RightChild(theStmt);
-        // std::string varSub = STInvertedMap[];
+        
+        // If left child is another AssignOp, the variable is its right child
+        tree varNode;
+        if (!IsNull(leftAssign) && NodeKind(leftAssign) == EXPRNode && NodeOp(leftAssign) == AssignOp)
+            varNode = RightChild(leftAssign);
+        else
+            varNode = leftAssign;
+
+        // Navigate to the STNode id
+        tree varId;
+        if (!IsNull(varNode) && NodeKind(varNode) == EXPRNode && NodeOp(varNode) == VarOp)
+            varId = LeftChild(varNode);
+        else
+            varId = varNode;
+
+        if (!IsNull(varId) && !IsNull(exprTree))
+        {
+            int stIdx = IntVal(varId);
+            llvm::Value *varPtr = (llvm::Value *)GetAttr(stIdx, OBJECT_ATTR);
+            llvm::Value *val = AddExpr((uintptr_t)exprTree);
+
+            if (varPtr && val)
+            {
+                TheBuilder.CreateStore(val, varPtr);
+            }
+        }
+        break;
     }
     case RoutineCallOp:
     {
-        // printf("wrrrds\n");
-        // AddRoutineCall(theStmt);
         llvm::Value *routineCall = AddRoutineCall(theStmt);
         break;
     }
     case IfElseOp:
     {
+        llvm::Function *func = TheBuilder.GetInsertBlock()->getParent();
+        llvm::BasicBlock *mergeBB = llvm::BasicBlock::Create(TheContext, "ifcont", func);
+
+        // Emit an if/else-if/else chain.
+        // elseBody is the trailing else statements (passed down from parent root node).
+        std::function<void(tree, llvm::BasicBlock*, tree)> emitIfChain =
+            [&](tree node, llvm::BasicBlock *afterBB, tree elseBody) {
+
+            if (IsNull(node) || NodeKind(node) != EXPRNode)
+                return;
+
+            tree rightChild = RightChild(node);
+            tree leftChild = LeftChild(node);
+
+            bool isCondNode = !IsNull(rightChild) && NodeKind(rightChild) == EXPRNode
+                              && NodeOp(rightChild) == CommaOp;
+
+            if (isCondNode)
+            {
+                // This node has condition on the right: CommaOp(condition, then_stmts)
+                // But left child may contain earlier conditions that should be checked first
+                
+                if (!IsNull(leftChild) && NodeKind(leftChild) == EXPRNode && NodeOp(leftChild) == IfElseOp)
+                {
+                    // Left has earlier conditions — process them first
+                    // This node's condition becomes an else-if after the left chain
+                    tree condition = LeftChild(rightChild);
+                    tree thenStmts = RightChild(rightChild);
+                    
+                    // Process the left chain; its then-blocks merge to afterBB
+                    // but its else fallthrough should come to this else-if condition
+                    // So we create the elseif block and pass it as the else destination
+                    llvm::BasicBlock *thisElseIfBB = llvm::BasicBlock::Create(TheContext, "elseif", func);
+                    
+                    // For the left chain: set elseBody to a marker that causes
+                    // the else to branch to thisElseIfBB. We achieve this by
+                    // processing the chain, then replacing the else terminator.
+                    
+                    // Process left chain normally
+                    emitIfChain(leftChild, afterBB, NullExp());
+                    // The insert point is at the innermost else block
+                    // Replace its terminator (which goes to afterBB) with a branch to thisElseIfBB
+                    llvm::BasicBlock *curBB = TheBuilder.GetInsertBlock();
+                    if (curBB->getTerminator())
+                        curBB->getTerminator()->eraseFromParent();
+                    TheBuilder.CreateBr(thisElseIfBB);
+                    
+                    // Now emit this else-if condition
+                    TheBuilder.SetInsertPoint(thisElseIfBB);
+                    llvm::Value *condVal = AddExpr((uintptr_t)condition);
+                    llvm::Value *condBool = TheBuilder.CreateICmpNE(
+                        condVal, llvm::ConstantInt::get(TheContext, llvm::APInt(32, 0)), "ifcond");
+                    
+                    llvm::BasicBlock *thenBB = llvm::BasicBlock::Create(TheContext, "then", func);
+                    llvm::BasicBlock *elseBB = llvm::BasicBlock::Create(TheContext, "else", func);
+                    
+                    TheBuilder.CreateCondBr(condBool, thenBB, elseBB);
+                    
+                    TheBuilder.SetInsertPoint(thenBB);
+                    AddStmt(thenStmts);
+                    if (!TheBuilder.GetInsertBlock()->getTerminator())
+                        TheBuilder.CreateBr(afterBB);
+                    
+                    TheBuilder.SetInsertPoint(elseBB);
+                    if (!IsNull(elseBody))
+                    {
+                        AddStmt(elseBody);
+                        if (!TheBuilder.GetInsertBlock()->getTerminator())
+                            TheBuilder.CreateBr(afterBB);
+                    }
+                    else
+                    {
+                        if (!TheBuilder.GetInsertBlock()->getTerminator())
+                            TheBuilder.CreateBr(afterBB);
+                    }
+                }
+                else
+                {
+                    // No left chain — this is the first (or only) if
+                    tree condition = LeftChild(rightChild);
+                    tree thenStmts = RightChild(rightChild);
+
+                    llvm::Value *condVal = AddExpr((uintptr_t)condition);
+                    llvm::Value *condBool = TheBuilder.CreateICmpNE(
+                        condVal, llvm::ConstantInt::get(TheContext, llvm::APInt(32, 0)), "ifcond");
+
+                    llvm::BasicBlock *thenBB = llvm::BasicBlock::Create(TheContext, "then", func);
+                    llvm::BasicBlock *elseBB = llvm::BasicBlock::Create(TheContext, "else", func);
+
+                    TheBuilder.CreateCondBr(condBool, thenBB, elseBB);
+
+                    TheBuilder.SetInsertPoint(thenBB);
+                    AddStmt(thenStmts);
+                    if (!TheBuilder.GetInsertBlock()->getTerminator())
+                        TheBuilder.CreateBr(afterBB);
+
+                    TheBuilder.SetInsertPoint(elseBB);
+                    if (!IsNull(elseBody))
+                    {
+                        AddStmt(elseBody);
+                        if (!TheBuilder.GetInsertBlock()->getTerminator())
+                            TheBuilder.CreateBr(afterBB);
+                    }
+                    else
+                    {
+                        // No else body — branch to afterBB unless caller will redirect
+                        if (!TheBuilder.GetInsertBlock()->getTerminator())
+                            TheBuilder.CreateBr(afterBB);
+                    }
+                }
+            }
+            else
+            {
+                // Root node: left = if/else-if chain, right = trailing else stmts
+                emitIfChain(leftChild, afterBB, rightChild);
+            }
+        };
+
+        emitIfChain(theStmt, mergeBB, NullExp());
+
+        TheBuilder.SetInsertPoint(mergeBB);
+        bb = mergeBB;
         break;
     }
     case ReturnOp:
@@ -660,7 +829,13 @@ static void AddArrInit(uintptr_t tnode)
 static llvm::Value *AddDeclVar(tree treenode)
 {
     tree varDeclId = LeftChild(treenode);
-    std::string variableName = STInvertedMap[IntVal(varDeclId)];
+    int stIdx = IntVal(varDeclId);
+    std::string variableName;
+    // STNode uses symbol table index, IDNode uses string table index
+    if (NodeKind(varDeclId) == STNode && STInvertedMap.count(stIdx))
+        variableName = STInvertedMap[stIdx];
+    else
+        variableName = getString(GetAttr(stIdx, NAME_ATTR));
     tree type = LeftChild(RightChild(treenode));
     tree varRightSide = LeftChild(RightChild(treenode));
 
@@ -671,8 +846,8 @@ static llvm::Value *AddDeclVar(tree treenode)
     llvm::ConstantInt *varInit = llvm::ConstantInt::get(TheContext, llvm::APInt(32, 4));
     // is this variable is associated with a value, do not create a nullptr as the value for the initial allocation.
     llvm::Value *iVar = TheBuilder.CreateAlloca(llvm::Type::getInt32Ty(TheContext), nullptr, variableName);
-    llvm::Value *varLoad = TheBuilder.CreateLoad(varInit, iVar, "y");
-    printf("%d name: %s\n", IntVal(varDeclId), variableName.c_str());
+    llvm::Value *varLoad = TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), iVar, "y");
+    // fprintf(stderr, "DEBUG AddDeclVar: stIdx=%d name='%s' nodeKind=%d\n", stIdx, variableName.c_str(), NodeKind(varDeclId));
     SetAttr(IntVal(varDeclId), OBJECT_ATTR, (uintptr_t)iVar);
     return varLoad;
 }
@@ -694,9 +869,18 @@ static void AddDeclList(tree treenode)
     {
         return;
     }
-    tree currVar = RightChild(treenode);
-    AddDeclLine(currVar);
-    AddDeclLine(LeftChild(treenode));
+
+    // Recursively walk the tree looking for DeclOp nodes
+    if (NodeKind(treenode) == EXPRNode && NodeOp(treenode) == DeclOp)
+    {
+        AddDeclLine(treenode);
+    }
+    else
+    {
+        // BodyOp or other container — recurse both children
+        AddDeclList(LeftChild(treenode));
+        AddDeclList(RightChild(treenode));
+    }
 }
 
 static void AddMethodArgs(tree treenode)
@@ -815,7 +999,7 @@ static void emitSymbol(int idx)
             // get the global var version of this type that I just made.
             llvm::GlobalVariable *classTypeVar = TheModule->getNamedGlobal(globalName);
 
-            classTypeVar->setInitializer(llvm::ConstantStruct::get(classType, {llvm::ConstantInt::get(TheContext, llvm::APInt(32, -1))}));
+            classTypeVar->setInitializer(llvm::ConstantStruct::get(classType, {llvm::ConstantInt::get(TheContext, llvm::APInt(32, -1, true))}));
             // get it cause he's the teacher and its his class so its also his node
             if (IsAttr(idx, INIT_ATTR) == 1)
             {
@@ -912,7 +1096,10 @@ static void initPrintF()
     if (!funcPrintf)
     {
         int printfIntex = STMap["println"];
-        llvm::FunctionType *funcPrintfType = llvm::FunctionType::get(llvm::IntegerType::get(TheContext, 32), true);
+        llvm::FunctionType *funcPrintfType = llvm::FunctionType::get(
+            llvm::IntegerType::get(TheContext, 32),
+            {llvm::PointerType::getUnqual(TheContext)},
+            true);
         funcPrintf = llvm::Function::Create(funcPrintfType, llvm::Function::ExternalLinkage, "printf", TheModule.get());
         funcPrintf->setCallingConv(llvm::CallingConv::C);
 

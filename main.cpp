@@ -13,6 +13,8 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <stdio.h>
+
+extern "C" int yyparse(void);
 #include <unistd.h>
 
 extern "C"

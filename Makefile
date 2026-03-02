@@ -14,15 +14,17 @@ DIFFS := $(foreach test,$(TESTS),diffs/$(test:tests/%.mjava=%).diff)
 EXAMPLES = $(wildcard examples/*.cpp)
 EXAMPLE_OUTPUTS = $(foreach example,$(EXAMPLES),examples_outputs/$(example:examples/%.cpp=%).codegen.out)
 
-CXX = clang++-10 -stdlib=libc++
-CC = clang-10
+LLVM_PREFIX = $(shell brew --prefix llvm)
+CXX = $(LLVM_PREFIX)/bin/clang++
+CC = $(LLVM_PREFIX)/bin/clang
 CFLAGS = -g -I .
-LLVMCXXFLAGS = `llvm-config-10 --cxxflags`
-LLVMCFLAGS = `llvm-config-10 --cflags`
-LLVMFLAGS = `llvm-config-10 --cxxflags --ldflags --system-libs --libs all`
+LLVM_CONFIG = $(LLVM_PREFIX)/bin/llvm-config
+LLVMCXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
+LLVMCFLAGS = $(shell $(LLVM_CONFIG) --cflags)
+LLVMFLAGS = $(shell $(LLVM_CONFIG) --cxxflags --ldflags --system-libs --libs all) -L/opt/homebrew/opt/llvm/lib/c++ -lc++
 
 FLEX = flex
-YACC = yacc
+YACC = /opt/homebrew/bin/byacc
 
 all: build examples test
 build: codegen
@@ -30,7 +32,7 @@ examples: $(EXAMPLE_OUTPUTS)
 test: $(OUTPUTS) $(DIFFS)
 
 codegen: ${OBJ}
-	${CXX} ${CFLAGS} ${LLVMFLAGS} -o codegen ${OBJ} -lfl
+	${CXX} ${CFLAGS} ${LLVMFLAGS} -o codegen ${OBJ} -ll
 
 lex.yy.c: lex.l
 	$(FLEX) lex.l
