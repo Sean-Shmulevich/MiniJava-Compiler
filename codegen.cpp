@@ -128,30 +128,39 @@ std::map<std::string, tree> getMethodProperties(tree treenode)
 //     TheBuilder.CreateRet(llvm::ConstantInt::get(TheContext, llvm::APInt(32, 0)));
 // }
 // this could maybe be made into a more generic thing other than a function.
-static llvm::Function *makeFuncHeader(std::string name, tree typeNode)
-{
+// Count parameters in the arg tree (RArgTypeOp/VArgTypeOp chain)
+static int countArgs(tree argNode) {
+    if (IsNull(argNode)) return 0;
+    if (NodeOp(argNode) == RArgTypeOp || NodeOp(argNode) == VArgTypeOp) {
+        return 1 + countArgs(RightChild(argNode));
+    }
+    return 0;
+}
 
+static llvm::Function *makeFuncHeader(std::string name, tree typeNode, tree argsNode = nullptr)
+{
     tree typeId = LeftChild(typeNode);
     // no examples have this.
     tree subtype = RightChild(typeNode);
 
+    // Determine return type
     int typeKind = NodeKind(typeId);
+    llvm::Type *retType = llvm::Type::getInt32Ty(TheContext);
+
+    // Count and build parameter types
+    int nArgs = countArgs(argsNode);
+    std::vector<llvm::Type*> paramTypes(nArgs, llvm::Type::getInt32Ty(TheContext));
+
     llvm::FunctionType *funcType;
     if (typeKind == STNode)
     {
-        // TODO: make it the type of the enclosing class.
-        // we need to make sure we are in the class.
-        // no we are in the program scope, we need to make sure its in the program scope.
-        // then lookup that value in scope.
-        funcType = llvm::FunctionType::get(llvm::Type::getInt32Ty(TheContext), currClass, true);
-    }
-    else if (typeKind == INTEGERTNode)
-    {
-        funcType = llvm::FunctionType::get(llvm::Type::getInt32Ty(TheContext), false);
+        // Class return type — prepend class pointer param
+        paramTypes.insert(paramTypes.begin(), currClass);
+        funcType = llvm::FunctionType::get(retType, paramTypes, false);
     }
     else
     {
-        funcType = llvm::FunctionType::get(llvm::Type::getInt32Ty(TheContext), false);
+        funcType = llvm::FunctionType::get(retType, paramTypes, false);
     }
     llvm::Function *func = llvm::Function::Create(funcType, llvm::Function::ExternalLinkage, llvm::StringRef(name), TheModule.get());
 
@@ -770,6 +779,37 @@ static void AddStmt(tree theStmt)
     }
     case LoopOp:
     {
+        // while (condition) { body }
+        // LoopOp: left = condition, right = body
+        llvm::Function *func = TheBuilder.GetInsertBlock()->getParent();
+
+        llvm::BasicBlock *condBB = llvm::BasicBlock::Create(TheContext, "loop.cond", func);
+        llvm::BasicBlock *bodyBB = llvm::BasicBlock::Create(TheContext, "loop.body", func);
+        llvm::BasicBlock *endBB  = llvm::BasicBlock::Create(TheContext, "loop.end", func);
+
+        // Branch from current block to condition check
+        TheBuilder.CreateBr(condBB);
+
+        // Emit condition
+        TheBuilder.SetInsertPoint(condBB);
+        tree condExpr = LeftChild(theStmt);
+        llvm::Value *cond = AddExpr((uintptr_t)condExpr);
+        // If AddExpr returns an i32, convert to i1
+        if (cond->getType()->isIntegerTy(32)) {
+            cond = TheBuilder.CreateICmpNE(cond, llvm::ConstantInt::get(TheContext, llvm::APInt(32, 0)), "tobool");
+        }
+        TheBuilder.CreateCondBr(cond, bodyBB, endBB);
+
+        // Emit body
+        TheBuilder.SetInsertPoint(bodyBB);
+        AddStmt(RightChild(theStmt));
+        // After body, branch back to condition (only if no terminator yet)
+        if (!TheBuilder.GetInsertBlock()->getTerminator()) {
+            TheBuilder.CreateBr(condBB);
+        }
+
+        // Continue after the loop
+        TheBuilder.SetInsertPoint(endBB);
         break;
     }
     default:
@@ -891,18 +931,44 @@ static void AddMethodArgs(tree treenode)
     }
 
     int opType = NodeOp(treenode);
-    if (opType == RArgTypeOp || VArgTypeOp)
+    if (opType == RArgTypeOp || opType == VArgTypeOp)
     {
-        // todo, add to function stack
         tree opData = LeftChild(treenode);
         tree argId = LeftChild(opData);
         tree integerT = RightChild(opData);
         tree nextArg = RightChild(treenode);
 
+        // Get the ST index for this arg and create an alloca for it
+        int stIdx = IntVal(argId);
+        std::string argName = STInvertedMap[stIdx];
+        llvm::AllocaInst *alloca = TheBuilder.CreateAlloca(
+            llvm::Type::getInt32Ty(TheContext), nullptr, argName);
+        SetAttr(stIdx, OBJECT_ATTR, (uintptr_t)alloca);
+
+        // Recurse first so args are numbered correctly (left to right)
         AddMethodArgs(nextArg);
         return;
     }
-    // else if(opType == VArgTypeOp)
+}
+
+// Store the function's actual argument values into the allocas created by AddMethodArgs
+static void StoreMethodArgs(tree treenode, llvm::Function *func, unsigned argIdx = 0)
+{
+    if (IsNull(treenode)) return;
+
+    int opType = NodeOp(treenode);
+    if (opType == RArgTypeOp || opType == VArgTypeOp)
+    {
+        tree opData = LeftChild(treenode);
+        tree argId = LeftChild(opData);
+        int stIdx = IntVal(argId);
+
+        llvm::Argument *llvmArg = func->getArg(argIdx);
+        llvm::Value *alloca = (llvm::Value *)GetAttr(stIdx, OBJECT_ATTR);
+        TheBuilder.CreateStore(llvmArg, alloca);
+
+        StoreMethodArgs(RightChild(treenode), func, argIdx + 1);
+    }
 }
 static void AddMethod(tree treenode)
 {
@@ -922,12 +988,12 @@ static void AddMethod(tree treenode)
         // get the string from the number of this symbol in the symbol table
         // inverted mapping gets ST_INDEX -> symbol STRING
         auto idString = STInvertedMap[IntVal(props["method_id"])];
-        llvm::Function *fnHeader = makeFuncHeader(idString, props["method_type"]);
+        llvm::Function *fnHeader = makeFuncHeader(idString, props["method_type"], props["method_args"]);
+        bb = initFuncBlock(fnHeader);
 
         AddDeclList(props["method_decl_list"]);
-        // add arglist to the context of this function definition.
-        // make vars in the function we are currently in.
         AddMethodArgs(props["method_args"]);
+        StoreMethodArgs(props["method_args"], fnHeader);
         // inside of the method block.
         // there are a list of semicolon separated statements.
         // AddMethod(props["method_block"]);
@@ -1045,35 +1111,41 @@ static void emitSymbol(int idx)
             // todo, do this after the first function.
             if (name.compare("main") == 0)
             {
-                // main is in its own block?
-                llvm::FunctionType *funcType = llvm::FunctionType::get(llvm::Type::getInt32Ty(TheContext), false);
-
-                llvm::Function *func = llvm::Function::Create(funcType, llvm::Function::ExternalLinkage, llvm::StringRef(name), TheModule.get());
-                bb = initFuncBlock(func);
-                setConstants();
-                // TODO : MID 5AM type logic
                 if (IsAttr(idx, INIT_ATTR) == 1)
                 {
+                    tree methNode = (tree)GetAttr(idx, INIT_ATTR);
+                    llvm::FunctionType *funcType = llvm::FunctionType::get(llvm::Type::getInt32Ty(TheContext), false);
+                    llvm::Function *func = llvm::Function::Create(funcType, llvm::Function::ExternalLinkage, llvm::StringRef(name), TheModule.get());
+                    bb = initFuncBlock(func);
+                    setConstants();
+
                     llvm::Value *funcVal = (llvm::Value *)func;
-                    // TODO: i think this needs to be after.
                     SetAttr(idx, OBJECT_ATTR, (uintptr_t)funcVal);
 
-                    tree methNode = (tree)GetAttr(idx, INIT_ATTR);
-
-                    AddMethod(methNode);
-                    // after doing this I want to set the LLLVM object.
+                    if (!IsNull(methNode) && NodeOp(methNode) == MethodOp) {
+                        std::map<std::string, tree> props = getMethodProperties(methNode);
+                        AddDeclList(props["method_decl_list"]);
+                        AddMethodArgs(props["method_args"]);
+                        AddStmt(props["method_stmts"]);
+                    }
                 }
             }
             else if (IsAttr(idx, INIT_ATTR) == 1)
             {
-                llvm::Function *func = makeFuncHeader(name, (tree)GetAttr(idx, TYPE_ATTR));
-                bb = initFuncBlock(func);
-
-                llvm::Value *funcVal = (llvm::Value *)func;
-                // TODO: i think this needs to be after.
-                SetAttr(idx, OBJECT_ATTR, (uintptr_t)funcVal);
                 tree methNode = (tree)GetAttr(idx, INIT_ATTR);
-                AddMethod(methNode);
+                if (!IsNull(methNode) && NodeOp(methNode) == MethodOp) {
+                    std::map<std::string, tree> props = getMethodProperties(methNode);
+
+                    llvm::Function *func = makeFuncHeader(name, props["method_type"], props["method_args"]);
+                    bb = initFuncBlock(func);
+                    llvm::Value *funcVal = (llvm::Value *)func;
+                    SetAttr(idx, OBJECT_ATTR, (uintptr_t)funcVal);
+
+                    AddDeclList(props["method_decl_list"]);
+                    AddMethodArgs(props["method_args"]);
+                    StoreMethodArgs(props["method_args"], func);
+                    AddStmt(props["method_stmts"]);
+                }
                 // after doing this I want to set the LLLVM object.
             }
         }
@@ -1116,7 +1188,6 @@ void codegen()
     // setConstants();
     for (int i = 1; i < GetSymbolTableSize(); i++)
     {
-        // printf("%d \n", i);
         emitSymbol(i);
     }
 }
