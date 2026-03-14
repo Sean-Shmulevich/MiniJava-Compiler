@@ -43,6 +43,16 @@ static std::map<std::string, int> STMap;
 static std::map<int, std::string> STInvertedMap;
 static llvm::StructType *currClass;
 
+// Track class struct types: class name -> { structType, fieldNames (in order) }
+struct ClassInfo {
+    llvm::StructType *structType;
+    std::vector<std::string> fieldNames;    // field name at each offset
+    std::vector<int> fieldSTIndices;        // ST index of each field
+    llvm::GlobalVariable *globalVar;        // the Class.global instance
+    int stIndex;                            // ST index of the class itself
+};
+static std::map<std::string, ClassInfo> classInfoMap;
+
 static llvm::BasicBlock *bb;
 // Helper function to get or create a string constant
 static void setConstants()
@@ -145,7 +155,8 @@ static llvm::Function *makeFuncHeader(std::string name, tree typeNode, tree args
 
     // Determine return type
     int typeKind = NodeKind(typeId);
-    llvm::Type *retType = llvm::Type::getInt32Ty(TheContext);
+    bool isVoid = (typeKind == DUMMYNode);
+    llvm::Type *retType = isVoid ? llvm::Type::getVoidTy(TheContext) : llvm::Type::getInt32Ty(TheContext);
 
     // Count and build parameter types
     int nArgs = countArgs(argsNode);
@@ -204,16 +215,100 @@ static std::vector<llvm::Value *> AddCallArgs(tree argsList)
 }
 
 // returns the fn (for now).
+static std::string getClassNameForVar(int stIdx);
+static int findEnclosingClass(int stIdx);
+
+// Resolve a VarOp that may have field selectors (obj.field)
+// Returns a pointer (GEP) to the field, or nullptr if not a field access
+static llvm::Value *resolveFieldAccess(tree varOp) {
+    tree varId = LeftChild(varOp);
+    tree selectOp = RightChild(varOp);
+
+    if (IsNull(selectOp) || NodeKind(selectOp) != EXPRNode || NodeOp(selectOp) != SelectOp) {
+        return nullptr; // Not a field access
+    }
+
+    // Get the object being accessed
+    int objStIdx = IntVal(varId);
+    std::string objName = STInvertedMap[objStIdx];
+    int objKind = GetAttr(objStIdx, KIND_ATTR);
+
+    // Find the class type of this object
+    std::string className;
+    llvm::Value *objPtr = nullptr;
+
+    if (objKind == CLASS) {
+        // Direct class access: ClassName.field (uses global instance)
+        className = objName;
+        if (classInfoMap.count(className)) {
+            objPtr = classInfoMap[className].globalVar;
+        }
+    } else {
+        // Variable access: varName.field
+        className = getClassNameForVar(objStIdx);
+        if (IsAttr(objStIdx, OBJECT_ATTR)) {
+            objPtr = (llvm::Value *)GetAttr(objStIdx, OBJECT_ATTR);
+        } else {
+            // Variable doesn't have OBJECT_ATTR yet — might be a class field
+            // Find enclosing class and GEP into its global
+            int encClass = findEnclosingClass(objStIdx);
+            if (encClass >= 0) {
+                std::string encClassName = getString(GetAttr(encClass, NAME_ATTR));
+                if (classInfoMap.count(encClassName)) {
+                    ClassInfo &encCI = classInfoMap[encClassName];
+                    int varOffset = IsAttr(objStIdx, OFFSET_ATTR) ? GetAttr(objStIdx, OFFSET_ATTR) : -1;
+                    if (varOffset >= 0) {
+                        objPtr = TheBuilder.CreateStructGEP(encCI.structType, encCI.globalVar, varOffset, objName);
+                    }
+                }
+            }
+        }
+    }
+
+    if (className.empty() || !classInfoMap.count(className) || !objPtr) {
+        return nullptr;
+    }
+
+    ClassInfo &ci = classInfoMap[className];
+
+    // Navigate FieldOp to find the field name
+    tree fieldOp = LeftChild(selectOp);
+    if (IsNull(fieldOp)) return nullptr;
+
+    tree fieldId;
+    if (NodeKind(fieldOp) == EXPRNode && NodeOp(fieldOp) == FieldOp) {
+        fieldId = LeftChild(fieldOp);
+    } else {
+        fieldId = fieldOp;
+    }
+
+    if (IsNull(fieldId)) return nullptr;
+    int fieldStIdx = IntVal(fieldId);
+    std::string fieldName = STInvertedMap[fieldStIdx];
+
+    // Find field offset
+    int fieldOffset = -1;
+    if (IsAttr(fieldStIdx, OFFSET_ATTR)) {
+        fieldOffset = GetAttr(fieldStIdx, OFFSET_ATTR);
+    } else {
+        // Search in class field names
+        for (int f = 0; f < (int)ci.fieldNames.size(); f++) {
+            if (ci.fieldNames[f] == fieldName) {
+                fieldOffset = f;
+                break;
+            }
+        }
+    }
+
+    if (fieldOffset < 0 || fieldOffset >= (int)ci.fieldNames.size()) return nullptr;
+
+    // Create GEP to access the field
+    return TheBuilder.CreateStructGEP(ci.structType, objPtr, fieldOffset, objName + "." + fieldName);
+}
+
 static llvm::Value *AddField(tree treenode)
 {
-    tree fieldOp = LeftChild(treenode);
-    tree fieldId = LeftChild(LeftChild(treenode));
-    tree nextSelect = RightChild(treenode);
-
-    llvm::Value *llvmFunc = (llvm::Value *)GetAttr(IntVal(fieldId), OBJECT_ATTR);
-    // printf("HERE?\n");
-    // todo, recurse right for more selectOP,s
-    return llvmFunc;
+    return resolveFieldAccess(treenode);
 }
 
 static llvm::Value *AddRoutineCall(tree theStmt)
@@ -281,12 +376,13 @@ static llvm::Value *AddRoutineCall(tree theStmt)
         arguments = AddCallArgs(argumentTree);
 
         llvm::Function *llvmFn = llvm::dyn_cast<llvm::Function>(llvmFunc);
+        if (llvmFn->getReturnType()->isVoidTy())
+            return TheBuilder.CreateCall(llvmFn, arguments);
         return TheBuilder.CreateCall(llvmFn, arguments, "ELLLO");
     }
     // Case 2: Simple function call without SelectOp
     else if (!IsNull(theStmt) && IsNull(selectOp))
     {
-        // printf("the one without params\n");
         int stIndex = IntVal(LeftChild(LeftChild(theStmt)));
 
         funcValue = GetAttr(stIndex, OBJECT_ATTR);
@@ -299,8 +395,9 @@ static llvm::Value *AddRoutineCall(tree theStmt)
 
         arguments = AddCallArgs(argumentTree);
         llvm::Function *llvmFn2 = llvm::dyn_cast<llvm::Function>(llvmFunc);
-        llvm::CallInst *callInst = TheBuilder.CreateCall(llvmFn2, arguments, "ELLLO");
-        return callInst;
+        if (llvmFn2->getReturnType()->isVoidTy())
+            return TheBuilder.CreateCall(llvmFn2, arguments);
+        return TheBuilder.CreateCall(llvmFn2, arguments, "ELLLO");
     }
     else
     {
@@ -344,76 +441,46 @@ static llvm::Value *AddFactor(uintptr_t factorTree)
         {
             tree factorId = LeftChild(factor);
             std::string factorStr = STInvertedMap[IntVal(factorId)];
-            // printf("Here in ada %s\n", getString(IntVal(factor)));
-            llvm::Value *fieldOps = AddField(factor);
-            // if the value is a class.
-            // is it a STNode?
-            // what is the condition for class?
-            // printf("%d %s\n", GetAttr(IntVal(factorId), KIND_ATTR) == CLASS, factorStr.c_str());
-            // lookup X in current scope before creating.
-            // the class ones will be created before the function yes.
 
-            // If I make sure that all of the decl are created before I come here,
-            // I can translate OBJECT_ATTR -> llvm::Value, and check if that value is a function or a class
-            // it has pops on it. like ->getType()
-            // DO AN extra pass to add in the Decls.
-            llvm::GlobalVariable *globalStr = TheModule->getGlobalVariable("Variables.global");
-            // check if something exists, where? in globals?
-            // this is where we get variable value.
-            llvm::Value *opInit = (llvm::Value *)GetAttr(IntVal(factorId), OBJECT_ATTR);
-            // printf("when we tried to find the declaratino var we found, %d", IntVal(factorId));
-            // we have a variable?
-            // we have a var if the type of the node is alloc
+            // Check for field access (obj.field)
+            llvm::Value *fieldPtr = resolveFieldAccess(factor);
+            if (fieldPtr) {
+                // Load the i32 value from the struct field GEP
+                return TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), fieldPtr, factorStr + ".val");
+            }
 
-            // opInit->getType();
-            // .getName -> lookup in StMap mapping ->
+            // Simple variable access
+            int varStIdx = IntVal(factorId);
+            llvm::Value *opInit = IsAttr(varStIdx, OBJECT_ATTR) ? (llvm::Value *)GetAttr(varStIdx, OBJECT_ATTR) : nullptr;
             if (opInit)
             {
-
                 if (llvm::AllocaInst *alloca = llvm::dyn_cast<llvm::AllocaInst>(opInit))
                 {
-                    // Load the value from the local variable
                     return TheBuilder.CreateLoad(alloca->getAllocatedType(), alloca, factorStr);
                 }
                 else
                 {
-
-                    // llvm::Value *classUsage = TheBuilder.CreateStructGEP(TheModule->getNamedGlobal("Variables.global"), 0, "point.x");
-                    // also
-                    // With opaque pointers, we need to figure out the pointee type.
-                    // For global variables, use getValueType(); otherwise default to i32.
                     llvm::Type *loadTy = llvm::Type::getInt32Ty(TheContext);
                     if (auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(opInit))
                         loadTy = GV->getValueType();
-                    llvm::Value *classLoad = TheBuilder.CreateLoad(loadTy, opInit, "point.x.val");
-                    return classLoad;
+                    return TheBuilder.CreateLoad(loadTy, opInit, factorStr + ".val");
                 }
             }
-            // else /* if (NodeKind(factor) == VAR)*/
-            // {
-            //     // llvm::ConstantInt *varInit = llvm::ConstantInt::get(TheContext, llvm::APInt(32, 4));
-            //     // llvm::AllocaInst *iVar = TheBuilder.CreateAlloca(llvm::Type::getInt32Ty(TheContext), nullptr, factorStr);
-            //     // TheBuilder.CreateStore(llvm::ConstantInt::get(TheContext, llvm::APInt(32, 4)), iVar);
 
-            //     // llvm::Value *varLoad = TheBuilder.CreateLoad(varInit, iVar, "y");
-            //     // get iVar from looking up the factor str.
-            //     // llvm::Value *iVal = TheBuilder.CreateLoad(iVar->getAllocatedType(), iVar, factorStr);
-
-            //     // // llvm::Value *varStore = TheBuilder.CreateStore(varLoad, varStore);
-            //     // return iVal;
-            // }
-
-            // Assume this is the varop for the class (for now)
-
-            // get the value at that name of class.
-            // basically the name of var should either be created or looked up.
-
-            // llvm::Value *classStore = TheBuilder.CreateStore(classUsage, classLoad);
-
-            // return
-            // return a variable node.
-            // return;
-            // emit its usage?
+            // Fallback: class field without OBJECT_ATTR — GEP into enclosing class global
+            if (IsAttr(varStIdx, OFFSET_ATTR)) {
+                int encClass = findEnclosingClass(varStIdx);
+                if (encClass >= 0) {
+                    std::string encClassName = getString(GetAttr(encClass, NAME_ATTR));
+                    if (classInfoMap.count(encClassName)) {
+                        ClassInfo &ci = classInfoMap[encClassName];
+                        int offset = GetAttr(varStIdx, OFFSET_ATTR);
+                        llvm::Value *gep = TheBuilder.CreateStructGEP(ci.structType, ci.globalVar, offset, encClassName + "." + factorStr);
+                        return TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), gep, factorStr + ".val");
+                    }
+                }
+            }
+            return nullptr;
         }
         else if (NodeOp(factor) == RoutineCallOp)
         {
@@ -626,8 +693,27 @@ static void AddStmt(tree theStmt)
 
         if (!IsNull(varId) && !IsNull(exprTree))
         {
-            int stIdx = IntVal(varId);
-            llvm::Value *varPtr = (llvm::Value *)GetAttr(stIdx, OBJECT_ATTR);
+            // Check if this is a field access (obj.field := expr)
+            llvm::Value *varPtr = nullptr;
+            if (!IsNull(varNode) && NodeKind(varNode) == EXPRNode && NodeOp(varNode) == VarOp) {
+                varPtr = resolveFieldAccess(varNode);
+            }
+            if (!varPtr) {
+                int stIdx = IntVal(varId);
+                if (IsAttr(stIdx, OBJECT_ATTR)) {
+                    varPtr = (llvm::Value *)GetAttr(stIdx, OBJECT_ATTR);
+                } else if (IsAttr(stIdx, OFFSET_ATTR)) {
+                    // Class field fallback
+                    int encClass = findEnclosingClass(stIdx);
+                    if (encClass >= 0) {
+                        std::string encClassName = getString(GetAttr(encClass, NAME_ATTR));
+                        if (classInfoMap.count(encClassName)) {
+                            ClassInfo &ci = classInfoMap[encClassName];
+                            varPtr = TheBuilder.CreateStructGEP(ci.structType, ci.globalVar, GetAttr(stIdx, OFFSET_ATTR), encClassName + "." + STInvertedMap[stIdx]);
+                        }
+                    }
+                }
+            }
             llvm::Value *val = AddExpr((uintptr_t)exprTree);
 
             if (varPtr && val)
@@ -772,8 +858,13 @@ static void AddStmt(tree theStmt)
     {
         // left of a return op is the subtree for expression.
         tree exprTree = LeftChild(theStmt);
-        llvm::Value *expr = AddExpr((uintptr_t)exprTree);
-        TheBuilder.CreateRet(expr);
+        llvm::Function *curFunc = TheBuilder.GetInsertBlock()->getParent();
+        if (curFunc->getReturnType()->isVoidTy()) {
+            TheBuilder.CreateRetVoid();
+        } else {
+            llvm::Value *expr = AddExpr((uintptr_t)exprTree);
+            TheBuilder.CreateRet(expr);
+        }
         break;
     }
     case LoopOp:
@@ -865,29 +956,55 @@ static void AddArrInit(uintptr_t tnode)
     AddArrInit((uintptr_t)RightChild(treenode));
 }
 
+// Get the class name for a variable's type (if it's class-typed)
+static std::string getClassNameForVar(int stIdx) {
+    if (!IsAttr(stIdx, TYPE_ATTR)) return "";
+    tree typeNode = (tree)GetAttr(stIdx, TYPE_ATTR);
+    if (IsNull(typeNode)) return "";
+
+    // Direct STNode reference to a class
+    if (NodeKind(typeNode) == STNode) {
+        int typeStIdx = IntVal(typeNode);
+        if (GetAttr(typeStIdx, KIND_ATTR) == CLASS) {
+            return getString(GetAttr(typeStIdx, NAME_ATTR));
+        }
+    }
+    // TypeIdOp with STNode child
+    if (NodeKind(typeNode) == EXPRNode && NodeOp(typeNode) == TypeIdOp) {
+        tree lc = LeftChild(typeNode);
+        if (!IsNull(lc) && NodeKind(lc) == STNode) {
+            int typeStIdx = IntVal(lc);
+            if (GetAttr(typeStIdx, KIND_ATTR) == CLASS) {
+                return getString(GetAttr(typeStIdx, NAME_ATTR));
+            }
+        }
+    }
+    return "";
+}
+
 static llvm::Value *AddDeclVar(tree treenode)
 {
     tree varDeclId = LeftChild(treenode);
     int stIdx = IntVal(varDeclId);
     std::string variableName;
-    // STNode uses symbol table index, IDNode uses string table index
     if (NodeKind(varDeclId) == STNode && STInvertedMap.count(stIdx))
         variableName = STInvertedMap[stIdx];
     else
         variableName = getString(GetAttr(stIdx, NAME_ATTR));
-    tree type = LeftChild(RightChild(treenode));
-    tree varRightSide = LeftChild(RightChild(treenode));
 
-    // store if initialized
-    // allocate if the variable is associated with a method decl.
-    // if its a class do what?
+    // Check if this variable's type is a class (struct)
+    std::string className = getClassNameForVar(stIdx);
+    if (!className.empty() && classInfoMap.count(className)) {
+        ClassInfo &ci = classInfoMap[className];
+        llvm::Value *iVar = TheBuilder.CreateAlloca(ci.structType, nullptr, variableName);
+        SetAttr(stIdx, OBJECT_ATTR, (uintptr_t)iVar);
+        return iVar;
+    }
 
-    llvm::ConstantInt *varInit = llvm::ConstantInt::get(TheContext, llvm::APInt(32, 4));
-    // is this variable is associated with a value, do not create a nullptr as the value for the initial allocation.
+    // Default: i32 alloca
     llvm::Value *iVar = TheBuilder.CreateAlloca(llvm::Type::getInt32Ty(TheContext), nullptr, variableName);
     llvm::Value *varLoad = TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), iVar, "y");
-    // fprintf(stderr, "DEBUG AddDeclVar: stIdx=%d name='%s' nodeKind=%d\n", stIdx, variableName.c_str(), NodeKind(varDeclId));
-    SetAttr(IntVal(varDeclId), OBJECT_ATTR, (uintptr_t)iVar);
+    SetAttr(stIdx, OBJECT_ATTR, (uintptr_t)iVar);
     return varLoad;
 }
 
@@ -1057,25 +1174,11 @@ static void emitSymbol(int idx)
         }
         else
         {
-            llvm::StructType *classType = llvm::StructType::create(TheContext, {llvm::Type::getInt32Ty(TheContext)}, name);
-            currClass = classType;
-            std::string globalName = name.append(".global");
-            TheModule->getOrInsertGlobal(globalName, classType);
-            // get the global var version of this type that I just made.
-            llvm::GlobalVariable *classTypeVar = TheModule->getNamedGlobal(globalName);
-
-            classTypeVar->setInitializer(llvm::ConstantStruct::get(classType, {llvm::ConstantInt::get(TheContext, llvm::APInt(32, -1, true))}));
-            // get it cause he's the teacher and its his class so its also his node
-            if (IsAttr(idx, INIT_ATTR) == 1)
-            {
-                tree ahnsNode = (tree)GetAttr(idx, INIT_ATTR);
-                AddClass(ahnsNode);
+            // Struct type and global already created in buildClassTypes()
+            // Just set currClass for context
+            if (classInfoMap.count(name)) {
+                currClass = classInfoMap[name].structType;
             }
-
-            llvm::Value *typeAsVal = classTypeVar;
-
-            // TheModule->getOrInsertGlobal(name, classType);
-            SetAttr(idx, OBJECT_ATTR, (uintptr_t)typeAsVal);
         }
 
         // std::vector<llvm::Type *> classFields;
@@ -1137,6 +1240,7 @@ static void emitSymbol(int idx)
 
                     llvm::Function *func = makeFuncHeader(name, props["method_type"], props["method_args"]);
                     bb = initFuncBlock(func);
+                    setConstants();
                     llvm::Value *funcVal = (llvm::Value *)func;
                     SetAttr(idx, OBJECT_ATTR, (uintptr_t)funcVal);
 
@@ -1178,13 +1282,196 @@ static void initPrintF()
     }
 }
 
+// Find which class a symbol belongs to by walking backwards to find
+// the enclosing CLASS symbol (nest level one less than this symbol)
+static int findEnclosingClass(int stIdx) {
+    int myNest = GetAttr(stIdx, NEST_ATTR);
+    for (int j = stIdx - 1; j >= 1; j--) {
+        if (GetAttr(j, KIND_ATTR) == CLASS && GetAttr(j, NEST_ATTR) == myNest - 1) {
+            return j;
+        }
+    }
+    return -1;
+}
+
+// Helper: get the class name a TYPE_ATTR tree refers to
+static std::string getClassNameFromTypeTree(tree typeNode) {
+    if (IsNull(typeNode)) return "";
+    if (NodeKind(typeNode) == STNode) {
+        int stIdx = IntVal(typeNode);
+        if (GetAttr(stIdx, KIND_ATTR) == CLASS)
+            return getString(GetAttr(stIdx, NAME_ATTR));
+    }
+    if (NodeKind(typeNode) == EXPRNode && NodeOp(typeNode) == TypeIdOp) {
+        tree lc = LeftChild(typeNode);
+        if (!IsNull(lc) && NodeKind(lc) == STNode) {
+            int stIdx = IntVal(lc);
+            if (GetAttr(stIdx, KIND_ATTR) == CLASS)
+                return getString(GetAttr(stIdx, NAME_ATTR));
+        }
+    }
+    return "";
+}
+
+// Pass 1: Build class struct types with proper field counts
+static void buildClassTypes() {
+    // Sub-pass 1a: Create opaque struct types for all classes
+    struct PreClassInfo {
+        int stIndex;
+        std::string name;
+        int classNest;
+        llvm::StructType *structType;
+        std::vector<std::string> fieldNames;
+        std::vector<int> fieldSTIndices;
+    };
+    std::vector<PreClassInfo> classes;
+
+    for (int i = 1; i < GetSymbolTableSize(); i++) {
+        if (GetAttr(i, KIND_ATTR) != CLASS) continue;
+        std::string className = getString(GetAttr(i, NAME_ATTR));
+        if (className == "system") continue;
+
+        PreClassInfo pci;
+        pci.stIndex = i;
+        pci.name = className;
+        pci.classNest = GetAttr(i, NEST_ATTR);
+        pci.structType = llvm::StructType::create(TheContext, className);
+        classes.push_back(pci);
+
+        // Register early so other classes can reference this type
+        ClassInfo ci;
+        ci.structType = pci.structType;
+        ci.stIndex = i;
+        ci.globalVar = nullptr;
+        classInfoMap[className] = ci;
+    }
+
+    // Sub-pass 1b: Collect fields and set struct bodies
+    for (auto &pci : classes) {
+        int maxOffset = -1;
+        for (int j = pci.stIndex + 1; j < GetSymbolTableSize(); j++) {
+            int jKind = GetAttr(j, KIND_ATTR);
+            int jNest = GetAttr(j, NEST_ATTR);
+            if (jNest <= pci.classNest) break;
+            if (jKind == VAR && jNest == pci.classNest + 1 && IsAttr(j, OFFSET_ATTR)) {
+                int off = GetAttr(j, OFFSET_ATTR);
+                if (off > maxOffset) maxOffset = off;
+                while ((int)pci.fieldNames.size() <= off) {
+                    pci.fieldNames.push_back("");
+                    pci.fieldSTIndices.push_back(-1);
+                }
+                pci.fieldNames[off] = getString(GetAttr(j, NAME_ATTR));
+                pci.fieldSTIndices[off] = j;
+            }
+        }
+
+        int numFields = maxOffset + 1;
+        if (numFields < 1) numFields = 1;
+
+        // Determine field types (i32 for primitives, struct for class-typed)
+        std::vector<llvm::Type*> fieldTypes;
+        for (int f = 0; f < numFields; f++) {
+            if (f < (int)pci.fieldSTIndices.size() && pci.fieldSTIndices[f] >= 0) {
+                int fIdx = pci.fieldSTIndices[f];
+                if (IsAttr(fIdx, TYPE_ATTR)) {
+                    tree typeNode = (tree)GetAttr(fIdx, TYPE_ATTR);
+                    std::string typeName = getClassNameFromTypeTree(typeNode);
+                    if (!typeName.empty() && classInfoMap.count(typeName)) {
+                        fieldTypes.push_back(classInfoMap[typeName].structType);
+                        continue;
+                    }
+                }
+            }
+            fieldTypes.push_back(llvm::Type::getInt32Ty(TheContext));
+        }
+        pci.structType->setBody(fieldTypes);
+
+        // Create global instance
+        std::string globalName = pci.name + ".global";
+        TheModule->getOrInsertGlobal(globalName, pci.structType);
+        llvm::GlobalVariable *classTypeVar = TheModule->getNamedGlobal(globalName);
+
+        // Build initializer
+        std::vector<llvm::Constant*> initVals;
+        for (int f = 0; f < numFields; f++) {
+            if (f < (int)pci.fieldSTIndices.size() && pci.fieldSTIndices[f] >= 0) {
+                int fIdx = pci.fieldSTIndices[f];
+                // Check if class-typed field
+                if (IsAttr(fIdx, TYPE_ATTR)) {
+                    tree typeNode = (tree)GetAttr(fIdx, TYPE_ATTR);
+                    std::string typeName = getClassNameFromTypeTree(typeNode);
+                    if (!typeName.empty() && classInfoMap.count(typeName)) {
+                        // Initialize with the referenced class's default values
+                        ClassInfo &refCI = classInfoMap[typeName];
+                        llvm::GlobalVariable *refGlobal = refCI.globalVar;
+                        if (refGlobal && refGlobal->hasInitializer()) {
+                            initVals.push_back(refGlobal->getInitializer());
+                        } else {
+                            initVals.push_back(llvm::Constant::getNullValue(refCI.structType));
+                        }
+                        continue;
+                    }
+                }
+                // Int field with default value
+                if (IsAttr(fIdx, INIT_ATTR)) {
+                    tree initNode = (tree)GetAttr(fIdx, INIT_ATTR);
+                    if (!IsNull(initNode) && NodeKind(initNode) == NUMNode) {
+                        initVals.push_back(llvm::ConstantInt::get(TheContext, llvm::APInt(32, IntVal(initNode), true)));
+                        continue;
+                    }
+                }
+            }
+            // Check if this field is a struct type
+            if (fieldTypes[f]->isStructTy()) {
+                initVals.push_back(llvm::Constant::getNullValue(fieldTypes[f]));
+            } else {
+                initVals.push_back(llvm::ConstantInt::get(TheContext, llvm::APInt(32, -1, true)));
+            }
+        }
+        classTypeVar->setInitializer(llvm::ConstantStruct::get(pci.structType, initVals));
+
+        // Update classInfoMap
+        ClassInfo &ci = classInfoMap[pci.name];
+        ci.fieldNames = pci.fieldNames;
+        ci.fieldSTIndices = pci.fieldSTIndices;
+        ci.globalVar = classTypeVar;
+
+        SetAttr(pci.stIndex, OBJECT_ATTR, (uintptr_t)classTypeVar);
+        currClass = pci.structType;
+
+        // fprintf(stderr, "  class %s: %d fields\n", pci.name.c_str(), numFields);
+    }
+}
+
+// Set up OBJECT_ATTR for class-level variable fields that need GEP access
+static void setupClassFieldObjects() {
+    for (auto &pair : classInfoMap) {
+        ClassInfo &ci = pair.second;
+        for (int f = 0; f < (int)ci.fieldSTIndices.size(); f++) {
+            int fIdx = ci.fieldSTIndices[f];
+            if (fIdx < 0) continue;
+            // Skip if already has OBJECT_ATTR
+            if (IsAttr(fIdx, OBJECT_ATTR)) continue;
+
+            // For class-typed fields, the OBJECT_ATTR should point to a GEP into the global
+            // For int fields, also set up GEP so they're accessible
+            // We need a builder with no insert point for constant GEPs... 
+            // Actually, for globals we can't use TheBuilder (no insertion point yet).
+            // Instead, just set OBJECT_ATTR to a marker and handle in resolveFieldAccess.
+            // OR: we can just leave them and let resolveFieldAccess handle it through the parent class.
+        }
+    }
+}
+
 void codegen()
 {
-    // llvm::BasicBlock *program_block = llvm::BasicBlock::Create(TheContext, "entry");
-    // TheBuilder.SetInsertPoint(program_block);
     makeStMap();
     initPrintF();
-    // setConstants();
+
+    // Pass 1: build class struct types with proper fields
+    buildClassTypes();
+
+    // Pass 2: emit all symbols
     for (int i = 1; i < GetSymbolTableSize(); i++)
     {
         emitSymbol(i);
