@@ -306,6 +306,98 @@ static llvm::Value *resolveFieldAccess(tree varOp) {
     return TheBuilder.CreateStructGEP(ci.structType, objPtr, fieldOffset, objName + "." + fieldName);
 }
 
+// Resolve array indexing: arr[i][j] → GEP with indices
+// Returns a pointer to the indexed element, or nullptr if not an array access
+static llvm::Value *resolveArrayAccess(tree varOp) {
+    tree varId = LeftChild(varOp);
+    tree selectChain = RightChild(varOp);
+
+    // Check if this is an array variable
+    int varStIdx = IntVal(varId);
+    if (GetAttr(varStIdx, KIND_ATTR) != ARR) return nullptr;
+
+
+    // Collect indices from the SelectOp/IndexOp chain
+    std::vector<llvm::Value*> indices;
+    tree current = selectChain;
+    while (!IsNull(current) && NodeKind(current) == EXPRNode) {
+        if (NodeOp(current) == SelectOp) {
+            tree indexOp = LeftChild(current);
+            if (!IsNull(indexOp) && NodeKind(indexOp) == EXPRNode && NodeOp(indexOp) == IndexOp) {
+                // IndexOp: RightChild = index expr (printed above = right), LeftChild = next
+                tree indexExpr = RightChild(indexOp);
+                if (IsNull(indexExpr)) indexExpr = LeftChild(indexOp);
+                if (!IsNull(indexExpr) && NodeKind(indexExpr) == EXPRNode) {
+                    llvm::Value *idx = AddExpr((uintptr_t)indexExpr);
+                    indices.push_back(idx);
+                }
+            }
+            current = RightChild(current); // next SelectOp in chain
+        } else if (NodeOp(current) == IndexOp) {
+            // Direct IndexOp (not wrapped in SelectOp)
+            tree indexExpr = RightChild(current);
+            if (IsNull(indexExpr)) indexExpr = LeftChild(current);
+            if (!IsNull(indexExpr) && NodeKind(indexExpr) == EXPRNode) {
+                llvm::Value *idx = AddExpr((uintptr_t)indexExpr);
+                indices.push_back(idx);
+            }
+            current = LeftChild(current);
+        } else {
+            break;
+        }
+    }
+
+    if (indices.empty()) return nullptr;
+
+    // Get the array's base pointer
+    llvm::Value *arrPtr = nullptr;
+    llvm::Type *arrType = nullptr;
+
+    // First check if this is a local array (has OBJECT_ATTR from AddDeclVar)
+    if (IsAttr(varStIdx, OBJECT_ATTR)) {
+        llvm::Value *localArr = (llvm::Value*)GetAttr(varStIdx, OBJECT_ATTR);
+        if (localArr && localArr->getType()->isPointerTy()) {
+            // Get the alloca'd array type from DIMEN_ATTR
+            if (IsAttr(varStIdx, DIMEN_ATTR)) {
+                std::vector<int> *dimVec = (std::vector<int>*)GetAttr(varStIdx, DIMEN_ATTR);
+                if (dimVec && !dimVec->empty()) {
+                    arrType = llvm::Type::getInt32Ty(TheContext);
+                    for (int d = 0; d < (int)dimVec->size(); d++) {
+                        arrType = llvm::ArrayType::get(arrType, (*dimVec)[d]);
+                    }
+                    arrPtr = localArr;
+                }
+            }
+        }
+    }
+
+    // Fall back to class field lookup
+    if (!arrPtr) {
+        int encClass = findEnclosingClass(varStIdx);
+        if (encClass >= 0) {
+            std::string encClassName = getString(GetAttr(encClass, NAME_ATTR));
+            if (classInfoMap.count(encClassName)) {
+                ClassInfo &ci = classInfoMap[encClassName];
+                int offset = GetAttr(varStIdx, OFFSET_ATTR);
+                arrPtr = TheBuilder.CreateStructGEP(ci.structType, ci.globalVar, offset, STInvertedMap[varStIdx]);
+                arrType = ci.structType->getElementType(offset);
+            }
+        }
+    }
+
+    if (!arrPtr || !arrType) return nullptr;
+
+    // Build GEP with all indices
+    // First index is 0 (dereference the pointer), then each array index
+    std::vector<llvm::Value*> gepIndices;
+    gepIndices.push_back(llvm::ConstantInt::get(TheContext, llvm::APInt(32, 0)));
+    for (auto *idx : indices) {
+        gepIndices.push_back(idx);
+    }
+
+    return TheBuilder.CreateGEP(arrType, arrPtr, gepIndices, "arr.elem");
+}
+
 static llvm::Value *AddField(tree treenode)
 {
     return resolveFieldAccess(treenode);
@@ -442,10 +534,15 @@ static llvm::Value *AddFactor(uintptr_t factorTree)
             tree factorId = LeftChild(factor);
             std::string factorStr = STInvertedMap[IntVal(factorId)];
 
+            // Check for array access (arr[i][j])
+            llvm::Value *arrPtr = resolveArrayAccess(factor);
+            if (arrPtr) {
+                return TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), arrPtr, factorStr + ".val");
+            }
+
             // Check for field access (obj.field)
             llvm::Value *fieldPtr = resolveFieldAccess(factor);
             if (fieldPtr) {
-                // Load the i32 value from the struct field GEP
                 return TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), fieldPtr, factorStr + ".val");
             }
 
@@ -693,10 +790,11 @@ static void AddStmt(tree theStmt)
 
         if (!IsNull(varId) && !IsNull(exprTree))
         {
-            // Check if this is a field access (obj.field := expr)
+            // Check if this is an array or field access
             llvm::Value *varPtr = nullptr;
             if (!IsNull(varNode) && NodeKind(varNode) == EXPRNode && NodeOp(varNode) == VarOp) {
-                varPtr = resolveFieldAccess(varNode);
+                varPtr = resolveArrayAccess(varNode);
+                if (!varPtr) varPtr = resolveFieldAccess(varNode);
             }
             if (!varPtr) {
                 int stIdx = IntVal(varId);
@@ -1001,8 +1099,36 @@ static llvm::Value *AddDeclVar(tree treenode)
         return iVar;
     }
 
+    // Check if this is a local array variable
+    if (GetAttr(stIdx, KIND_ATTR) == ARR && IsAttr(stIdx, DIMEN_ATTR)) {
+        std::vector<int> *dimVec = (std::vector<int>*)GetAttr(stIdx, DIMEN_ATTR);
+        if (dimVec && !dimVec->empty()) {
+            llvm::Type *arrType = llvm::Type::getInt32Ty(TheContext);
+            for (int d = 0; d < (int)dimVec->size(); d++) {
+                arrType = llvm::ArrayType::get(arrType, (*dimVec)[d]);
+            }
+            llvm::Value *iVar = TheBuilder.CreateAlloca(arrType, nullptr, variableName);
+            SetAttr(stIdx, OBJECT_ATTR, (uintptr_t)iVar);
+            return iVar;
+        }
+    }
+
     // Default: i32 alloca
     llvm::Value *iVar = TheBuilder.CreateAlloca(llvm::Type::getInt32Ty(TheContext), nullptr, variableName);
+
+    // Check for initializer: CommaOp(STNode, CommaOp(TypeIdOp, InitExpr))
+    // InitExpr is at RightChild(RightChild(treenode))
+    tree initExpr = RightChild(RightChild(treenode));
+    if (!IsNull(initExpr) && (NodeKind(initExpr) == NUMNode || NodeKind(initExpr) == EXPRNode)) {
+        if (NodeKind(initExpr) == NUMNode) {
+            int initVal = IntVal(initExpr);
+            TheBuilder.CreateStore(llvm::ConstantInt::get(TheContext, llvm::APInt(32, initVal, true)), iVar);
+        } else {
+            llvm::Value *val = AddExpr((uintptr_t)initExpr);
+            if (val) TheBuilder.CreateStore(val, iVar);
+        }
+    }
+
     llvm::Value *varLoad = TheBuilder.CreateLoad(llvm::Type::getInt32Ty(TheContext), iVar, "y");
     SetAttr(stIdx, OBJECT_ATTR, (uintptr_t)iVar);
     return varLoad;
@@ -1353,7 +1479,7 @@ static void buildClassTypes() {
             int jKind = GetAttr(j, KIND_ATTR);
             int jNest = GetAttr(j, NEST_ATTR);
             if (jNest <= pci.classNest) break;
-            if (jKind == VAR && jNest == pci.classNest + 1 && IsAttr(j, OFFSET_ATTR)) {
+            if ((jKind == VAR || jKind == ARR) && jNest == pci.classNest + 1 && IsAttr(j, OFFSET_ATTR)) {
                 int off = GetAttr(j, OFFSET_ATTR);
                 if (off > maxOffset) maxOffset = off;
                 while ((int)pci.fieldNames.size() <= off) {
@@ -1368,11 +1494,59 @@ static void buildClassTypes() {
         int numFields = maxOffset + 1;
         if (numFields < 1) numFields = 1;
 
-        // Determine field types (i32 for primitives, struct for class-typed)
+        // Determine field types (i32 for primitives, struct for class-typed, array for ARR)
         std::vector<llvm::Type*> fieldTypes;
         for (int f = 0; f < numFields; f++) {
             if (f < (int)pci.fieldSTIndices.size() && pci.fieldSTIndices[f] >= 0) {
                 int fIdx = pci.fieldSTIndices[f];
+                int fKind = GetAttr(fIdx, KIND_ATTR);
+
+                // Array field: extract dimensions from INIT_ATTR or DIMEN_ATTR
+                if (fKind == ARR && IsAttr(fIdx, INIT_ATTR)) {
+                    tree initNode = (tree)GetAttr(fIdx, INIT_ATTR);
+                    if (!IsNull(initNode) && NodeOp(initNode) == ArrayTypeOp) {
+                        std::vector<int> dims;
+                        // Try LeftChild for BoundOp chain (works for 2D+)
+                        tree boundNode = LeftChild(initNode);
+                        if (IsNull(boundNode) || NodeKind(boundNode) != EXPRNode || NodeOp(boundNode) != BoundOp) {
+                            // Try RightChild (alternative tree layout)
+                            boundNode = RightChild(initNode);
+                        }
+                        while (!IsNull(boundNode) && NodeKind(boundNode) == EXPRNode && NodeOp(boundNode) == BoundOp) {
+                            // Size can be in either child
+                            tree sizeNode = RightChild(boundNode);
+                            if (IsNull(sizeNode) || NodeKind(sizeNode) != NUMNode)
+                                sizeNode = LeftChild(boundNode);
+                            if (!IsNull(sizeNode) && NodeKind(sizeNode) == NUMNode)
+                                dims.push_back(IntVal(sizeNode));
+                            // Next BoundOp in either child
+                            tree next = LeftChild(boundNode);
+                            if (IsNull(next) || NodeKind(next) != EXPRNode || NodeOp(next) != BoundOp) {
+                                next = RightChild(boundNode);
+                                if (IsNull(next) || NodeKind(next) != EXPRNode || NodeOp(next) != BoundOp)
+                                    break;
+                            }
+                            boundNode = next;
+                        }
+                        // Fallback: use DIMEN_ATTR from symbol table (it's a std::vector<int>*)
+                        if (dims.empty() && IsAttr(fIdx, DIMEN_ATTR)) {
+                            std::vector<int> *dimVec = (std::vector<int>*)GetAttr(fIdx, DIMEN_ATTR);
+                            if (dimVec) {
+                                for (int dv : *dimVec) {
+                                    dims.push_back(dv);
+                                }
+                            }
+                        }
+                        llvm::Type *arrType = llvm::Type::getInt32Ty(TheContext);
+                        for (int d = 0; d < (int)dims.size(); d++) {
+                            arrType = llvm::ArrayType::get(arrType, dims[d]);
+                        }
+                        fieldTypes.push_back(arrType);
+                        continue;
+                    }
+                }
+
+                // Class-typed field
                 if (IsAttr(fIdx, TYPE_ATTR)) {
                     tree typeNode = (tree)GetAttr(fIdx, TYPE_ATTR);
                     std::string typeName = getClassNameFromTypeTree(typeNode);
@@ -1396,6 +1570,47 @@ static void buildClassTypes() {
         for (int f = 0; f < numFields; f++) {
             if (f < (int)pci.fieldSTIndices.size() && pci.fieldSTIndices[f] >= 0) {
                 int fIdx = pci.fieldSTIndices[f];
+                // Array fields: try to extract init values from CommaOp chain
+                if (fieldTypes[f]->isArrayTy()) {
+                    int fKind = GetAttr(fIdx, KIND_ATTR);
+                    bool gotInit = false;
+                    if (fKind == ARR && IsAttr(fIdx, INIT_ATTR)) {
+                        tree initNode = (tree)GetAttr(fIdx, INIT_ATTR);
+                        if (!IsNull(initNode) && NodeOp(initNode) == ArrayTypeOp) {
+                            // LeftChild is CommaOp chain with init values
+                            tree commaChain = LeftChild(initNode);
+                            std::vector<int> vals;
+                            while (!IsNull(commaChain) && NodeKind(commaChain) == EXPRNode && NodeOp(commaChain) == CommaOp) {
+                                tree valNode = RightChild(commaChain);
+                                if (!IsNull(valNode) && NodeKind(valNode) == NUMNode) {
+                                    vals.push_back(IntVal(valNode));
+                                }
+                                commaChain = LeftChild(commaChain);
+                            }
+                            if (!vals.empty()) {
+                                // vals are collected in reverse order (from tree)
+                                std::reverse(vals.begin(), vals.end());
+                                llvm::ArrayType *at = llvm::dyn_cast<llvm::ArrayType>(fieldTypes[f]);
+                                std::vector<llvm::Constant*> arrVals;
+                                for (int v = 0; v < (int)at->getNumElements(); v++) {
+                                    int val = (v < (int)vals.size()) ? vals[v] : 0;
+                                    arrVals.push_back(llvm::ConstantInt::get(TheContext, llvm::APInt(32, val, true)));
+                                }
+                                initVals.push_back(llvm::ConstantArray::get(at, arrVals));
+                                gotInit = true;
+                            }
+                        }
+                    }
+                    if (!gotInit) {
+                        initVals.push_back(llvm::Constant::getNullValue(fieldTypes[f]));
+                    }
+                    continue;
+                }
+                // Struct fields: zero-initialize
+                if (fieldTypes[f]->isStructTy()) {
+                    initVals.push_back(llvm::Constant::getNullValue(fieldTypes[f]));
+                    continue;
+                }
                 // Check if class-typed field
                 if (IsAttr(fIdx, TYPE_ATTR)) {
                     tree typeNode = (tree)GetAttr(fIdx, TYPE_ATTR);
