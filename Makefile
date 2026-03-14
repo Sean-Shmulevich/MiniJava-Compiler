@@ -19,9 +19,9 @@ CXX = $(LLVM_PREFIX)/bin/clang++
 CC = $(LLVM_PREFIX)/bin/clang
 CFLAGS = -g -I .
 LLVM_CONFIG = $(LLVM_PREFIX)/bin/llvm-config
-LLVMCXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
+LLVMCXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags) -isysroot $(shell xcrun --show-sdk-path)
 LLVMCFLAGS = $(shell $(LLVM_CONFIG) --cflags)
-LLVMFLAGS = $(shell $(LLVM_CONFIG) --cxxflags --ldflags --system-libs --libs all) -L/opt/homebrew/opt/llvm/lib/c++ -lc++
+LLVMFLAGS = $(shell $(LLVM_CONFIG) --cxxflags --ldflags --system-libs --libs all) -isysroot $(shell xcrun --show-sdk-path) -L/opt/homebrew/opt/llvm/lib/c++ -lc++
 
 FLEX = flex
 YACC = /opt/homebrew/bin/byacc

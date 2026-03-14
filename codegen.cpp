@@ -471,23 +471,22 @@ static llvm::Value *AddTerm(uintptr_t termTree)
     }
 
     int opType = NodeOp(term);
-    // if (opType == MultOp)
-    // {
-    //     // emit something and keep traversing
-    // }
-    // else if (opType == DivOp)
-    // {
-    //     // emit something and keep traversing
-    // }
-    // else if (opType == AndOp)
-    // {
-    //     // emit something and keep traversing
-    // }
-    // else
-    // {
-    //     // its just a factor
-    //     printf("Here in term\n");
-    // }
+    if (opType == MultOp || opType == DivOp || opType == AndOp)
+    {
+        tree leftTree = LeftChild(term);
+        tree rightTree = RightChild(term);
+        if (IsNull(leftTree) || IsNull(rightTree)) return nullptr;
+        llvm::Value *leftValue = AddTerm((uintptr_t)leftTree);
+        llvm::Value *rightValue = AddFactor((uintptr_t)rightTree);
+        if (!leftValue || !rightValue) return nullptr;
+
+        if (opType == MultOp)
+            return TheBuilder.CreateMul(leftValue, rightValue, "mul_result");
+        else if (opType == DivOp)
+            return TheBuilder.CreateSDiv(leftValue, rightValue, "div_result");
+        else // AndOp
+            return TheBuilder.CreateAnd(leftValue, rightValue, "and_result");
+    }
     return AddFactor(termTree);
 }
 
